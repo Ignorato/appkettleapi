@@ -38,9 +38,16 @@ import paho.mqtt.client as mqtt
 from Crypto.Cipher import AES
 
 from protocol_parser import unpack_msg, calc_msg_checksum
+import builtins as _builtins
+
+
+def print(*args, **kwargs):
+    """Timestamped stdout (2026-05-24 hardening) so daemon log lines can be dated."""
+    _builtins.print(time.strftime("[%Y-%m-%d %H:%M:%S]"), *args, **kwargs)
+
 
 DEBUG_MSG = True
-DEBUG_PRINT_STAT_MSG = True  # print status messages
+DEBUG_PRINT_STAT_MSG = False  # per-frame K-STAT spam OFF (ballooned log to 41MB) — 2026-05-24
 DEBUG_PRINT_KEEP_CONNECT = False  # print "keelconnect" packets
 SEND_ENCRYPTED = False  # use AES encryted comms with kettle
 MSGLEN = 3200  # max msg length: this needs to be long enough to allow a few msg to be received
@@ -48,6 +55,11 @@ MSGLEN = 3200  # max msg length: this needs to be long enough to allow a few msg
 KETTLE_SOCKET_CONNECT_ATTEMPTS = 3
 KETTLE_SOCKET_TIMEOUT_SECS = 60
 KEEP_WARM_MINS = 30  # Default keep warm amount
+# Auto-resync watchdog: if no valid kettle status parses for this long while the
+# socket still claims connected, force a reconnect to flush a desynced read buffer.
+# (2026-05-24 fix — the bridge had been stuck publishing status=Disconnected for days
+# because a misaligned buffer made every frame fail the length check.)
+RESYNC_TIMEOUT_SECS = 120
 
 ENCRYPT_HEADER = bytes([0x23, 0x23, 0x38, 0x30])
 PLAIN_HEADER = bytes([0x23, 0x23, 0x30, 0x30])
@@ -83,6 +95,7 @@ class AppKettle:
             "power": "OFF",
             "seq": 0,
         }
+        self.last_update_ts = time.time()  # refreshed on each valid status parse (resync watchdog)
 
     def tick(self):
         """Increments seq by 1. To be called when sending something to kettle"""
@@ -158,6 +171,7 @@ class AppKettle:
         if "data3" in msg:
             try:
                 self.stat.update(cmd_dict)
+                self.last_update_ts = time.time()  # valid status — feeds the resync watchdog
             except ValueError:
                 print("Error in data3 cmd_dict: ", cmd_dict)
                 return
@@ -536,8 +550,24 @@ def main_loop(host_port, imei, mqtt_broker):
                     "version",
                     "keep_warm_secs",
                     "keep_warm_onoff",
+                    "volume",
                 ]:
                     mqttc.publish("stat/" + MQTT_BASE + "/" + i, kettle.stat[i])
+
+        # Auto-resync watchdog: a desynced read buffer keeps parsing junk
+        # ("Length does not match ... ignoring msg") so kettle.stat never refreshes
+        # and the bridge gets stuck publishing status=Disconnected. Force a clean
+        # reconnect (flushes the buffer) if no valid status has parsed in a while.
+        if kettle_socket.connected and (
+            time.time() - kettle.last_update_ts > RESYNC_TIMEOUT_SECS
+        ):
+            print(
+                "No valid kettle status for %ds — forcing socket reconnect to resync"
+                % RESYNC_TIMEOUT_SECS
+            )
+            kettle_socket.close()
+            kettle_socket.connected = False
+            kettle.last_update_ts = time.time()
 
         if len(outfds) != 0:
             # print("we could be writing here")
